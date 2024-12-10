@@ -1,0 +1,35 @@
+---
+dependencies:
+  pkg_pre_requisites:
+    - epel-release
+    - yum-utils
+  pkg_docker:
+    #- docker-ce
+    #- docker-ce-cli
+    - containerd.io-{{containerd_version}}
+  pkg_kubernetes:
+    - kubeadm-{{kubernetes_version}}
+    - kubectl-{{kubernetes_version}}
+    - kubelet-{{kubernetes_version}}
+    
+  epel_package: https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+  rhel8_packages:
+    - python3
+    
+# defaults variables from AWX for the helm charts
+helm_binary: ""
+chart_name: ""
+k8s_current_context: ""
+endpoint: ""
+k8_key: ""
+binary_path: ""
+chart_ref_path: ""
+k8s_namespace: ""
+release_state: ""
+cacert: ""
+client_cert: ""
+client_key: ""
+#k8_service_account: ""
+helm_release_name: ""
+force_state: ""
+helm_values: {}

@@ -1,0 +1,339 @@
+### Pre_Requisites ###
+---
+- name: Register with the kubernetes repositories patch key
+  redhat_subscription:
+    state: present
+    activationkey: "{{ kube_activation_key }}"
+    org_id: "{{ org_name }}"
+    force_register: true
+
+- name: Upgrade packages after kube key update
+  dnf:
+    name: '*'
+    state: latest
+
+- name: Reboot the machine with all defaults
+  reboot:
+    reboot_timeout: 300
+
+- name: Uptime of the node
+  register: uptimeoutput
+  command: "uptime"
+- debug:
+    var: uptimeoutput.stdout_lines
+
+- name: Pause for 30 seconds to make the services active
+  pause:
+    seconds: 30
+
+- name: Disabling Swap on all nodes
+  become: true
+  shell: swapoff -a
+
+- name: Disable SWAP permanently in fstab
+  become: true
+  shell: |
+    sed -i.bak '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+- name: 'Stop and disable the firewalld service'
+  become: true
+  service:
+    name: 'firewalld'
+    state: 'stopped'
+    enabled: 'false'  
+
+#Disable node_exporter service
+- name: stop and disable a node_exporter service
+  become: true
+  service:
+    name: "node_exporter"
+    state: 'stopped'
+    enabled: 'false'
+
+- name: Disable SELinux
+  ansible.posix.selinux:
+    state: disabled
+  
+- name: pv creation
+  become: true
+  shell: "pvcreate /dev/sdb"
+  
+- name: vg creation
+  become: true
+  shell: "vgcreate kubevg /dev/sdb"
+  
+- name: lv creation
+  become: true
+  shell: "lvcreate --name containers -l 100%FREE kubevg"
+
+- name: Make filesystem xfs
+  become: true
+  shell: "mkfs.xfs /dev/kubevg/containers"
+  
+- name: Create containerd directory
+  become: true
+  shell: "mkdir containerd"
+  args:
+    chdir: /var/lib
+
+- name: Mount containerd directory
+  become: true
+  shell: "mount -t xfs /dev/kubevg/containers /var/lib/containerd"
+  args:
+    chdir: /var
+
+- name: Add partition to fstab
+  become: true
+  lineinfile:
+    path: /etc/fstab
+    line: /dev/mapper/kubevg-containers /var/lib/containerd xfs defaults 0 0
+
+- name: Remove noexec from /etc/fstab
+  become: yes
+  replace:
+    path: /etc/fstab
+    regexp: '^(.*\/dev\/mapper\/rootvg-lvvar\s+\/var\s+xfs\s+.*)noexec(,)?(.*)$'
+    replace: '\1\3'
+
+
+### IP Forwarding ###
+- name: add modprobe for all nodes
+  shell: "{{ item }}"
+  with_items:
+    - modprobe overlay
+    - modprobe br_netfilter
+
+- name: Let iptables see bridged traffic.
+  sysctl:
+    name: "{{ item }}"
+    value: '1'
+    state: present
+    sysctl_set: yes
+    ignoreerrors: true
+    reload: yes
+  loop:
+    - net.bridge.bridge-nf-call-iptables
+    - net.bridge.bridge-nf-call-ip6tables
+    - net.ipv4.ip_forward
+
+
+- name: Apply sysctl settings
+  shell: sysctl --system
+
+## Unmask, Start & Enable rpc-bind as a dependency for NFS ###
+- name: check rpcbind service status
+  service_facts:
+
+- name: Enable service rpcbind and ensure it is not masked
+  systemd:
+    name: rpcbind
+    state: started
+    enabled: yes
+    masked: no
+  when: '"rpcbind" in ansible_facts.services'
+
+# - name: Install python39 package 
+#   yum:
+#     name: python39
+#     state: present
+#   become: true
+
+- name: Install nfs-utils
+  yum:
+    name: nfs-utils
+    state: present
+  become: true
+
+- name: Install tc
+  yum:
+    name:  iproute
+    state: present
+  become: true 
+
+- name: install yum dependency packages for docker
+  yum:
+    name: yum-utils
+
+- name: add docker repo for containerd
+  become: true
+  shell: subscription-manager repos --enable=Neustar_Docker-CE_Docker-CE_RHEL_8
+
+- name: disabling repo for Kubernetes-1.24-1.29-* versions
+  become: true
+  shell: subscription-manager repos --disable={{ item }}
+  with_items: 
+    - Neustar_K8s_k8s-rhel8
+    - Neustar_K8s_k8s-rhel8-1_24
+    - Neustar_K8s_k8s-rhel8-1_25
+    - Neustar_K8s_k8s-rhel8-1_26
+    - Neustar_K8s_k8s-rhel8-1_29
+
+- name: Enabling repo for Kubernetes version 1.30.x
+  become: true
+  shell: subscription-manager repos --enable=Neustar_K8s_k8s-rhel8-1_30
+
+- name: uninstalling runc package
+  yum:
+    name: runc
+    state: absent
+
+- name: Installing container-selinux
+  become: true
+  shell: "rpm -ivh http://satellite-onedev.neustar.net/pulp/repos/Neustar/Library/custom/neustar_custom_patches/rhel_8_custom_patches/Packages/c/container-selinux-2.179.1-1.module+el8.6.0+14673+621cb8be.noarch.rpm"
+
+
+- name: install yum packages for containerd
+  yum:
+    name: "{{ dependencies.pkg_docker }}"
+
+- name: introducing pause to configure daemon to ready
+  pause:
+    seconds: 30
+  
+- name: start and enable Containerd 
+  service:
+    name: containerd.service
+    state: started
+    enabled: yes
+
+  #notify:
+  #  - start and enable Containerd 
+
+- name: config for containerd
+  shell: mkdir -p "{{ containerd_conf_file_dir }}"
+  
+- name: adding a containerd config.toml
+  template:
+    src: "{{ contanierd_conf_file }}"
+    dest: "{{ contanierd_conf_dest }}"
+  
+- name: copying jfrog CA cert to VM CA trustore
+  become: true
+  template:
+    src: "{{ tu_cert_conf_file }}"
+    dest: "{{ tu_cert_conf_dest }}"
+  when: ansible_os_family == "RedHat"
+
+- name: update trusted ca redhat
+  shell: /bin/update-ca-trust
+  when: ansible_os_family == "RedHat"
+
+- name: restart Containerd 
+  service:
+    name: containerd.service
+    state: restarted
+    enabled: yes
+
+- name: Pause for 30 seconds to make the services active
+  pause:
+    seconds: 30
+
+
+  #notify:
+  #  - restart Containerd
+
+ ### Kubernetes Setup ###
+- name: adding a repository file for Kubernetes
+  template:
+    src: "{{ kubernetes_repo_file }}"
+    dest: "{{ kubernetes_conf_dest }}"
+    
+- name: install yum packages for cri-tools
+  yum:
+    name: cri-tools-{{ crictl_version }}
+    state: present 
+
+    
+- name: install yum packages for kubernetes
+  yum:
+    name: "{{ dependencies.pkg_kubernetes }}"
+
+- name: introducing pause for providing delay to setup installed service
+  pause:
+    seconds: "{{ machine_pause_time }}"
+
+- name: start and enable kubernetes service
+  systemd:
+    name: kubelet.service
+    state: started
+    enabled: yes
+
+- name: introducing pause to configure daemon to ready
+  pause:
+    seconds: 30
+
+# enabling version lock to avoid accidental updates for K8s and CRI runtime packages
+- name: Install versionlock package to prevent packages from being updated
+  yum:
+    name: yum-plugin-versionlock
+  become: true
+
+- name: Prevent packages from auto-update
+  become: true
+  shell: yum versionlock kubeadm kubernetes-cni kubelet kubectl cri-tools containerd containerd.io falco
+
+- name: Register with the latest patch activationkey
+  redhat_subscription:
+    state: present
+    activationkey: "{{ rhsm_activation_key }}"
+    org_id: "{{ org_name }}"
+    force_register: true
+
+- name: Install python39 package 
+  yum:
+    name: python39
+    state: present
+  become: true
+  
+- name: Upgrade all packages excluding the versionlock packages
+  dnf:
+    name: '*'
+    state: latest
+
+- name: Reboot the machine with all defaults
+  reboot:
+    reboot_timeout: 300
+
+- name: Uptime of the node
+  register: uptimeoutput
+  command: "uptime"
+- debug:
+    var: uptimeoutput.stdout_lines
+
+- name: Pause for 30 seconds to make the services active
+  pause:
+    seconds: 30
+
+- name: check if /proc/sys/net/bridge/bridge-nf-call-iptables
+  stat: 
+    path: /proc/sys/net/bridge/bridge-nf-call-iptables
+  register: file_check 
+
+- name: Run modprobe and sysctl commands
+  block: 
+    - name: Load Kernel modules
+      shell: "{{ item }}"
+      with_items:
+        - modprobe overlay
+        - modprobe br_netfilter
+
+    - name: Load Kernel modules
+      shell: "{{ item }}"
+      with_items:
+        - modprobe overlay
+        - modprobe br_netfilter
+
+    - name: set sysctl parameters 
+      shell: "{{ item }}"
+      with_items:
+        - echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
+        - echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
+
+    - name: Apply sysctl settings 
+      shell: sysctl -p      
+  when: not file_check.stat.exists
+
+- name: crictl configuration settings
+  shell: crictl config --set runtime-endpoint=unix:///run/containerd/containerd.sock
+  
+  

@@ -1,0 +1,25 @@
+### K8s handlers ###
+
+---
+- name: Clear Yum cache
+  command: yum clean all
+  args:
+    warn: no
+- name: start and enable Containerd 
+  service:
+    name: containerd.service
+    state: started
+    enabled: yes
+  become: true
+- name: restart Containerd 
+  service:
+    name: containerd.service
+    state: restarted
+    enabled: yes
+  become: true
+- name: start and enable kubernetes service
+  systemd:
+    name: kubelet.service
+    state: started
+    enabled: yes
+  become: true

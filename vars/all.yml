@@ -1,0 +1,23 @@
+### kube intializing ### 
+primary_control_node: ""
+control_nodeport: ''
+initout: ''
+controlplane_token: ''
+worker_token: ''
+machine_reboot_time: ''
+machine_pause_time: ''
+containerd_conf_file_dir: ''
+contanierd_conf_file: ''
+contanierd_conf_dest: ''
+kubernetes_repo_file: ''
+kubernetes_conf_dest: ''
+kubeconfig_dir: ''
+kubeconfig_admin_file: ''
+permissions_for_kubeconfig: ''
+kubelet_config: ''
+containerLogMaxSize: ''
+containerLogMaxFiles: ''
+tu_cert_conf_file: ''
+tu_cert_conf_dest: ''
+
+

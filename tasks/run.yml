@@ -1,0 +1,289 @@
+##Initialise Control node################
+- name: Intialise control node
+  shell: kubeadm init --kubernetes-version="{{ kubernetes_version }}" --control-plane-endpoint "{{ primary_control_node }}:{{ control_nodeport }}" --upload-certs --pod-network-cidr="{{ network_cidr }}" --service-cidr="{{ service_cidr }}" --cri-socket=unix:///run/containerd/containerd.sock --image-repository="{{ image_repository }}"
+  register: output
+  when: "my_host_alias in groups['control'] and my_host_alias is defined"
+  become: true
+  tags: kubes
+- debug: var=output
+
+- set_fact:
+    initout: "{{ output.stdout }}"
+  when: "my_host_alias in groups['control'] and my_host_alias is defined"
+
+- set_fact: 
+    controlplane_token: "{{ initout | regex_search('(\\skubeadm.*\\n.*\\n.*)') | regex_replace('\\\\\\n',' ') | regex_replace('\\s\\s\\s\\s\\s',' ') }}"
+  when: "my_host_alias in groups['control'] and my_host_alias is defined"
+
+- set_fact:
+    worker_token: "{{ initout | regex_search('(\\n\\n(kubeadm.* \\\\\\n.*)\\s)') | regex_replace('\\\\\\n',' ') | regex_replace('\\s\\s\\s\\s\\s',' ') }}"
+  when: "my_host_alias in groups['control'] and my_host_alias is defined"
+
+- name: Run commands to create kube config
+  shell: "{{ item }}"
+  with_items:
+    - mkdir -p $HOME/.kube
+    - cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+    - chown $(id -u):$(id -g) $HOME/.kube/config
+  when: "my_host_alias in groups['control'] and my_host_alias is defined"
+  become: true
+  tags: kubes
+
+- name: introducing pause to pass health checks on AVI
+  pause:
+    seconds: 60
+  tags: setup
+  become: true
+
+
+- name: Copy CIDR manifest file
+  template:
+    src:  "{{cidr_manifest_src}}"
+    dest: "{{cidr_manifest_dest}}"
+    mode: '0600'
+  when: "my_host_alias in groups['control'] and my_host_alias is defined"
+  become: true
+  tags: kubes
+
+
+- name: Create a cidr network on a master node
+  command: "kubectl apply -f {{ pod_network_manifest }}"
+  when: "my_host_alias in groups['control'] and my_host_alias is defined"
+  become: true
+  tags: kubes
+
+- name: introducing pause to get the nodes ready
+  pause:
+    seconds: 60
+  tags: setup
+  become: true
+
+
+- name: Join control nodes with the existing control node
+  command: "{{ hostvars['Master1']['controlplane_token'] }}"
+  #command: kubeadm join dc15-kongk8s-dev.neustar.net:443 --token c9295p.hkabmmheasd7wzwp --discovery-token-ca-cert-hash sha256:e089113ad727878c3623c36b0a483ce355da88b53c7f9f5e007b5906cd0aec2f
+  when: "hostvars['Master1']['controlplane_token'] is defined and my_host_alias in groups['controllers'] and my_host_alias is defined"
+  become: true
+  tags: kubes
+
+- name: Join worker nodes to the control node
+  command: "{{ hostvars['Master1']['worker_token'] }}"
+  when: "hostvars['Master1']['worker_token'] is defined and my_host_alias in groups['workers'] and my_host_alias is defined"
+  become: true
+  tags: kubes
+  
+### Enabling Server-Metrics on K8's###
+- name: introducing pause for the cluster to be ready
+  pause:
+    seconds: 60
+  tags: setup
+  become: true
+
+- name: Run commands to create kube config on remaining master nodes
+  shell: "{{ item }}"
+  with_items:
+    - mkdir -p $HOME/.kube
+    - cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+    - chown $(id -u):$(id -g) $HOME/.kube/config
+  when: "my_host_alias in groups['controllers'] and my_host_alias is defined"
+  become: true
+  tags: kubes
+
+- name: Check if ServerTLSBootstrap is present
+  shell: 'grep -c "^serverTLSBootstrap: true" /var/lib/kubelet/config.yaml || true'
+  register: tls
+  become: true
+ 
+- name: Insert serverTLSBootstrap at the end of kubelet config file.
+  lineinfile:
+    path: /var/lib/kubelet/config.yaml
+    line: "serverTLSBootstrap: true"
+  become: true
+  register: file
+  when: tls.stdout == "0"
+
+- name: Adding line to the kubelet info
+  become: true 
+  blockinfile:
+    path: /var/lib/kubelet/config.yaml
+    block: |
+      containerLogMaxSize: {{ containerLogMaxSize }}
+      containerLogMaxFiles: {{ containerLogMaxFiles }}
+    state: present
+
+
+
+- name: Adding the CipherSuites line to the  kubelet config
+  lineinfile:
+    path: /var/lib/kubelet/config.yaml
+    line: "tlsCipherSuites: [TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,TLS_RSA_WITH_AES_128_GCM_SHA256,TLS_RSA_WITH_AES_256_GCM_SHA384,TLS_RSA_WITH_AES_128_CBC_SHA,TLS_RSA_WITH_AES_256_CBC_SHA]"
+    state: present
+
+- name: Adding line to the kubelet info
+  become: true 
+  blockinfile:
+    path: "{{kubelet_config}}"
+    block: |
+      containerLogMaxSize: {{ containerLogMaxSize }}
+      containerLogMaxFiles: {{ containerLogMaxFiles }}
+    state: present
+  
+- name: Restart kubelet server to get the config changes into effect
+  service:
+    name: kubelet
+    state: restarted
+  become: true
+  when: file.changed
+
+- name: introducing pause for the certs to be available
+  pause:
+    seconds: 30
+  tags: setup
+  become: true
+
+- name: Adding the cipherSuites line to the etcd
+  lineinfile:
+    path: /etc/kubernetes/manifests/etcd.yaml
+    insertbefore: 'image'
+    line: "    - --cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+    firstmatch: yes
+    state: present
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"
+
+- name: Adding the cipherSuites line to the kube apiserver
+  lineinfile:
+    path: /etc/kubernetes/manifests/kube-apiserver.yaml
+    insertbefore: 'image'
+    line: "    - --tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,TLS_RSA_WITH_AES_128_GCM_SHA256,TLS_RSA_WITH_AES_256_GCM_SHA384,TLS_RSA_WITH_AES_128_CBC_SHA,TLS_RSA_WITH_AES_256_CBC_SHA"
+    firstmatch: yes
+    state: present
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"
+
+- name: Adding the cipherSuites line to the kube-controller-manager.yaml
+  lineinfile:
+    path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+    insertbefore: 'image'
+    line: "    - --tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,TLS_RSA_WITH_AES_128_GCM_SHA256,TLS_RSA_WITH_AES_256_GCM_SHA384,TLS_RSA_WITH_AES_128_CBC_SHA,TLS_RSA_WITH_AES_256_CBC_SHA"
+    firstmatch: yes
+    state: present
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"
+
+- name: Adding the CipherSuites line to the  kube-scheduler
+  lineinfile:
+    path: /etc/kubernetes/manifests/kube-scheduler.yaml
+    insertbefore: 'image'
+    line: "    - --tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,TLS_RSA_WITH_AES_128_GCM_SHA256,TLS_RSA_WITH_AES_256_GCM_SHA384,TLS_RSA_WITH_AES_128_CBC_SHA,TLS_RSA_WITH_AES_256_CBC_SHA"
+    firstmatch: yes
+    state: present
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"
+
+- name: Commenting the phrase in kube-scheduler
+  replace:
+    path: /etc/kubernetes/manifests/kube-scheduler.yaml
+    regexp: '- --port=0'
+    replace: '#- --port=0'
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"
+
+- name: Commenting the phrase in kube-controller-manager
+  replace:
+    path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+    regexp: '- --port=0'
+    replace: '#- --port=0'
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"
+
+
+- name: Create audit directory
+  become: true
+  file:
+    path: /var/lib/containerd/audit
+    state: directory
+    mode: '0755'
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"
+
+- name: Copy the policy.yaml to the audit directory
+  become: true
+  copy:
+    src: ./policy.yaml
+    dest: /var/lib/containerd/audit/
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"  
+
+- name: Update apiserver manifest at kube-apiserver.yaml
+  lineinfile:
+    path: /etc/kubernetes/manifests/kube-apiserver.yaml
+    insertbefore: '--advertise-address'
+    line: "{{ item }}"
+  with_items:
+  - '    - --audit-policy-file=/etc/kubernetes/audit/policy.yaml'
+  - '    - --audit-log-path=/etc/kubernetes/audit/audit.log'
+  - '    - --audit-log-maxsize=500'
+  - '    - --audit-log-maxbackup=10'
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"
+
+- name: Add the volume mount in the kube-apiserver
+  lineinfile:
+    path: /etc/kubernetes/manifests/kube-apiserver.yaml
+    insertafter: 'volumeMounts:'
+    line: "{{ item }}"
+  with_items:
+  - '      name: audit'
+  - '    - mountPath: /etc/kubernetes/audit'
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"
+
+- name: Add the volumes in the kube-apiserver
+  blockinfile:
+    path: /etc/kubernetes/manifests/kube-apiserver.yaml
+    insertafter: 'volumes:'
+    block: |2
+        - hostPath:
+            path: /var/lib/containerd/audit
+            type: DirectoryOrCreate
+          name: audit
+  when: "my_host_alias in groups['controllers'] or my_host_alias in groups['control']"   
+
+- set_fact:
+    control_host: "{{ hostvars['Master1'].ansible_host }}"
+  
+- name: get csr certs to be approved
+  shell: kubectl get csr --no-headers | awk '{ print $1 }'
+  delegate_to: "{{ control_host }}"
+  delegate_facts: true
+  register: certs
+  become: true
+- debug: var=certs
+
+- name: approve csr certs
+  shell: kubectl certificate approve {{ item }}
+  delegate_to: "{{ control_host }}"
+  delegate_facts: true
+  with_items: "{{certs.stdout_lines}}"
+  become: true
+
+- name: Adding labels to the worker nodes. 
+  block:
+    - set_fact:
+        main_host: "{{ hostvars['Master1'].ansible_host }}"
+  
+    - name: Get hostname
+      when: "my_host_alias in groups['workers'] and my_host_alias is defined"
+      shell: echo $HOSTNAME
+      register: hostname_output
+      become: true
+    
+    - name: Debug hostname output
+      debug: 
+        var: hostname_output.stdout
+    
+    - name: Adding the labels to the worker nodes
+      when: "my_host_alias in groups['workers'] and my_host_alias is defined"
+      shell: kubectl label node {{ hostname_output.stdout }} kubernetes-host= --overwrite
+      become: true
+      delegate_to: "{{ main_host }}"
+      delegate_facts: true
+    
+    - name: introducing pause for the certs to be available
+      pause:
+        seconds: 30
+      tags: setup
+      become: true
+
+
